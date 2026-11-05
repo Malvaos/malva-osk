@@ -1,0 +1,414 @@
+// macOS-styled on-screen keyboard.
+//
+// Rust owns all state (modifiers, labels, key injection) and feeds this file a
+// model of rows and keys. Everything below is drawn from a single number,
+// `unit` (the width of a standard key), so the keyboard scales with the window.
+
+export struct KeyData {
+    id: int,
+    label: string,
+    sub: string,
+    icon: string,
+    x: float,
+    w: float,
+    kind: int,
+    active: bool,
+    locked: bool,
+    repeat: bool,
+    small: bool,
+}
+
+export struct RowData {
+    y: float,
+    h: float,
+    keys: [KeyData],
+}
+
+export global Theme {
+    in-out property <bool> dark: true;
+    // Leave empty for the system UI font, or set a family such as "Inter".
+    in-out property <string> font: "";
+
+    out property <brush> panel: dark
+        ? @linear-gradient(180deg, #303034f2 0%, #232326f2 100%)
+        : @linear-gradient(180deg, #e3e5eaf2 0%, #d1d4d9f2 100%);
+    out property <color> panel-border: dark ? #ffffff24 : #ffffffb3;
+    out property <color> key-bg: dark ? #5a5a5f : #ffffff;
+    out property <color> fn-bg: dark ? #3b3b40 : #adb3bc;
+    out property <color> edge: dark ? #0a0a0c : #898b91;
+    out property <color> fg: dark ? #ffffff : #000000;
+    out property <color> fg-sub: dark ? #ffffffa6 : #0000008c;
+    out property <color> accent: dark ? #0a84ff : #007aff;
+    out property <color> accent-down: dark ? #0a6bd1 : #0062cc;
+    out property <color> chrome: dark ? #ffffff85 : #00000073;
+    out property <color> chrome-hover: dark ? #ffffff1f : #0000001a;
+}
+
+global Icons {
+    out property <string> close: "M6 6 L18 18 M18 6 L6 18";
+    out property <string> grow: "M15 3 H21 V9 M9 21 H3 V15 M21 3 L14 10 M3 21 L10 14";
+    out property <string> shrink: "M4 14 H10 V20 M20 10 H14 V4 M14 10 L21 3 M3 21 L10 14";
+    out property <string> sun: "M12 7 A5 5 0 1 0 12 17 A5 5 0 1 0 12 7 Z M12 1.5 V3.5 M12 20.5 V22.5 M4.6 4.6 L6 6 M18 18 L19.4 19.4 M1.5 12 H3.5 M20.5 12 H22.5 M4.6 19.4 L6 18 M18 6 L19.4 4.6";
+    out property <string> moon: "M21 12.8 A9 9 0 1 1 11.2 3 A7 7 0 0 0 21 12.8 Z";
+}
+
+component IconButton inherits Rectangle {
+    in property <string> icon;
+    callback clicked();
+
+    width: 30px;
+    height: 28px;
+    border-radius: 8px;
+
+    // Only the primary button should light the button up or click it; the
+    // builtin `pressed` also reacts to right/middle clicks.
+    property <bool> left-down: false;
+
+    background: touch.has-hover || root.left-down ? Theme.chrome-hover : transparent;
+
+    Path {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 16px;
+        height: 16px;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: root.icon;
+        stroke: Theme.chrome;
+        stroke-width: 1.7px;
+        stroke-line-cap: round;
+        fill: transparent;
+    }
+
+    touch := TouchArea {
+        width: parent.width;
+        height: parent.height;
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                root.left-down = true;
+            } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
+                // Click only if the button comes back up inside the icon.
+                if (root.left-down && self.mouse-x >= 0px && self.mouse-x < self.width
+                        && self.mouse-y >= 0px && self.mouse-y < self.height) {
+                    root.clicked();
+                }
+                root.left-down = false;
+            } else if (e.kind == PointerEventKind.cancel) {
+                root.left-down = false;
+            }
+        }
+    }
+}
+
+component KeyCap inherits Rectangle {
+    in property <KeyData> data;
+    in property <length> unit: 60px;
+    callback activated(int);
+
+    property <int> ticks: 0;
+    // Only the primary button presses a key; the builtin `touch.pressed`
+    // also lights up (and would repeat) on right/middle clicks.
+    property <bool> left-down: false;
+    property <length> gap: root.unit * 0.07;
+    property <length> radius: root.unit * 0.17;
+    property <bool> is-func: root.data.kind == 1;
+    property <bool> has-icon: root.data.icon != "";
+    property <color> face-color: root.data.active ? Theme.accent : (root.is-func ? Theme.fn-bg : Theme.key-bg);
+    property <color> down-color: root.data.active ? Theme.accent-down : (root.is-func ? Theme.key-bg : Theme.fn-bg);
+    property <color> fg: root.data.active ? #ffffff : Theme.fg;
+    property <color> fg-sub: root.data.active ? #ffffffd9 : Theme.fg-sub;
+
+    // Filler keys (kind 3) line the rows up but draw and react to nothing.
+    visible: root.data.kind != 3;
+
+    // Hold to repeat: the first repeat comes after about 360 ms, then every 45 ms.
+    Timer {
+        interval: 45ms;
+        running: root.left-down && root.data.repeat;
+        triggered => {
+            root.ticks += 1;
+            if (root.ticks > 7) {
+                root.activated(root.data.id);
+            }
+        }
+    }
+
+    // The thin darker edge under each key.
+    Rectangle {
+        x: root.gap / 2;
+        y: root.gap / 2;
+        width: root.width - root.gap;
+        height: root.height - root.gap;
+        border-radius: root.radius;
+        background: Theme.edge;
+    }
+
+    face := Rectangle {
+        x: root.gap / 2;
+        y: root.gap / 2 + (root.left-down ? 1px : 0px);
+        width: root.width - root.gap;
+        height: root.height - root.gap - 1px;
+        border-radius: root.radius;
+        background: root.left-down ? root.down-color : root.face-color;
+        animate background {
+            duration: 80ms;
+            easing: ease-out;
+        }
+        animate y {
+            duration: 60ms;
+            easing: ease-out;
+        }
+
+        // Faint highlight along the top edge.
+        Rectangle {
+            x: root.radius * 0.6;
+            y: 0px;
+            width: parent.width - root.radius * 1.2;
+            height: 1px;
+            background: Theme.dark ? #ffffff1c : #ffffff00;
+        }
+
+        // Main label (centred, or sitting low when there is a small label above).
+        Text {
+            x: 0px;
+            width: parent.width;
+            y: root.has-icon ? parent.height * 0.58 : (root.data.sub != "" ? parent.height * 0.40 : 0px);
+            height: root.has-icon ? parent.height * 0.34 : (root.data.sub != "" ? parent.height * 0.52 : parent.height);
+            text: root.data.label;
+            color: root.fg;
+            font-family: Theme.font;
+            font-size: root.unit * (root.has-icon ? 0.19 : (root.data.small ? 0.22 : 0.34));
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        // Shifted symbol, drawn small above the label.
+        Text {
+            visible: root.data.sub != "";
+            x: 0px;
+            width: parent.width;
+            y: parent.height * 0.10;
+            height: parent.height * 0.36;
+            text: root.data.sub;
+            color: root.fg-sub;
+            font-family: Theme.font;
+            font-size: root.unit * 0.24;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        Path {
+            visible: root.has-icon;
+            width: root.unit * 0.40;
+            height: root.unit * 0.40;
+            x: (parent.width - self.width) / 2;
+            y: root.data.label != "" ? parent.height * 0.12 : (parent.height - self.height) / 2;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: root.has-icon ? root.data.icon : "M 0 0";
+            stroke: root.fg;
+            stroke-width: root.unit * 0.034;
+            stroke-line-cap: round;
+            fill: root.data.locked ? root.fg : transparent;
+        }
+
+        // Dot marking a locked modifier.
+        Rectangle {
+            visible: root.data.locked;
+            width: root.unit * 0.075;
+            height: self.width;
+            border-radius: self.width / 2;
+            background: root.fg;
+            x: (parent.width - self.width) / 2;
+            y: parent.height - self.height - root.unit * 0.08;
+        }
+    }
+
+    touch := TouchArea {
+        width: parent.width;
+        height: parent.height;
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                root.left-down = true;
+                root.ticks = 0;
+                root.activated(root.data.id);
+            } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
+                root.left-down = false;
+            } else if (e.kind == PointerEventKind.cancel) {
+                root.left-down = false;
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "OSK";
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+    preferred-width: 1040px;
+    preferred-height: 462px;
+    min-width: 585px;
+    min-height: 260px;
+
+    in property <[RowData]> rows;
+    in property <float> cols: 15;
+    in property <float> total-h: 5.62;
+    in property <string> status;
+    in property <bool> live;
+
+    callback key-activated(int);
+    callback drag-by(length, length);
+    callback resize-by(float);
+    callback toggle-theme();
+    callback quit();
+
+    // Transparent border around the panel, so its shadow has room to fade out.
+    property <length> edge: 28px;
+
+    panel := Rectangle {
+        x: root.edge;
+        y: root.edge;
+        width: root.width - 2 * root.edge;
+        height: root.height - 2 * root.edge;
+        border-radius: 22px;
+        background: Theme.panel;
+        border-width: 1px;
+        border-color: Theme.panel-border;
+        drop-shadow-blur: 26px;
+        drop-shadow-color: #00000070;
+        drop-shadow-offset-y: 8px;
+
+        // Title bar: drag anywhere on it to move the window.
+        bar := Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: 34px;
+
+            property <length> grab-x;
+            property <length> grab-y;
+            property <bool> dragging;
+
+            TouchArea {
+                width: parent.width;
+                height: parent.height;
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                        bar.grab-x = self.mouse-x;
+                        bar.grab-y = self.mouse-y;
+                        bar.dragging = true;
+                    } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
+                        bar.dragging = false;
+                    } else if (e.kind == PointerEventKind.cancel) {
+                        bar.dragging = false;
+                    }
+                }
+                moved => {
+                    if (bar.dragging) {
+                        root.drag-by(self.mouse-x - bar.grab-x, self.mouse-y - bar.grab-y);
+                    }
+                }
+            }
+
+            Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: 14px;
+                width: 38px;
+                height: 5px;
+                border-radius: 2.5px;
+                background: Theme.chrome;
+                opacity: 0.55;
+            }
+
+            Rectangle {
+                x: 18px;
+                y: (parent.height - self.height) / 2;
+                width: 7px;
+                height: 7px;
+                border-radius: 3.5px;
+                background: root.live ? #30d158 : #ff9f0a;
+            }
+
+            Text {
+                x: 31px;
+                y: 0px;
+                width: 300px;
+                height: parent.height;
+                text: root.status;
+                color: Theme.chrome;
+                font-family: Theme.font;
+                font-size: 11px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+
+            IconButton {
+                x: parent.width - 138px;
+                y: 3px;
+                icon: Theme.dark ? Icons.sun : Icons.moon;
+                clicked => {
+                    root.toggle-theme();
+                }
+            }
+            IconButton {
+                x: parent.width - 106px;
+                y: 3px;
+                icon: Icons.shrink;
+                clicked => {
+                    root.resize-by(0.9);
+                }
+            }
+            IconButton {
+                x: parent.width - 74px;
+                y: 3px;
+                icon: Icons.grow;
+                clicked => {
+                    root.resize-by(1.1);
+                }
+            }
+            IconButton {
+                x: parent.width - 42px;
+                y: 3px;
+                icon: Icons.close;
+                clicked => {
+                    root.quit();
+                }
+            }
+        }
+
+        // Keys. The grid is centred and sized to fit the space that is left.
+        kb := Rectangle {
+            x: 12px;
+            y: 34px;
+            width: parent.width - 24px;
+            height: parent.height - 34px - 12px;
+
+            property <length> unit: min(self.width / root.cols, self.height / root.total-h);
+
+            Rectangle {
+                width: root.cols * kb.unit;
+                height: root.total-h * kb.unit;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+
+                for row in root.rows : Rectangle {
+                    y: row.y * kb.unit;
+                    width: parent.width;
+                    height: row.h * kb.unit;
+
+                    for k in row.keys : KeyCap {
+                        x: k.x * kb.unit;
+                        width: k.w * kb.unit;
+                        height: parent.height;
+                        data: k;
+                        unit: kb.unit;
+                        activated(id) => {
+                            root.key-activated(id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

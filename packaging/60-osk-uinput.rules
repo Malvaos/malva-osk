@@ -1,0 +1,2 @@
+# Lets members of the "input" group create the virtual keyboard OSK types with.
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
